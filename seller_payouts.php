@@ -204,12 +204,10 @@ if (!function_exists('seller_label')) {
     {
         // Prefer farm_name from seller_applications.
         if (!empty($row['farm_name'])) { return (string)$row['farm_name']; }
+       if (!empty($row['display_name'])) { return (string)$row['display_name']; }		
         // Full name from users.
         $fn = trim(trim((string)($row['first_name'] ?? '')) . ' ' . trim((string)($row['last_name'] ?? '')));
         if ($fn !== '') { return $fn; }
-        foreach (['display_name', 'name', 'seller_name', 'business_name', 'store_name'] as $k) {
-            if (!empty($row[$k])) { return (string)$row[$k]; }
-        }
         if (!empty($row['email'])) { return (string)$row['email']; }
         return 'Seller #' . ($row['seller_id'] ?? $row['id'] ?? '?');
     }
@@ -288,37 +286,63 @@ if (!function_exists('bv_sp_read_balance')) {
             try {
                 $b = bv_seller_balance_get($sid);
                 if (is_array($b) && $b) {
+                   $hasAny = static function(array $b, array $keys): bool {
+                        foreach ($keys as $k) {
+                            if (array_key_exists($k, $b) && is_numeric($b[$k])) { return true; }
+                        }
+                        return false;
+                    };					
                     $pick = static function(array $b, array $keys): float {
                         foreach ($keys as $k) {
                             if (array_key_exists($k, $b) && is_numeric($b[$k])) { return (float)$b[$k]; }
                         }
                         return 0.0;
                     };
-                    $r = [
-                        'available' => $pick($b, ['available', 'available_balance', 'available_amount']),
-                        'pending'   => max(0.0, $pick($b, ['pending', 'pending_balance', 'pending_release'])),
-                        'locked'    => $pick($b, ['held', 'held_balance', 'locked', 'locked_balance', 'refund_locked']),
-                        'paid_out'  => $pick($b, ['paid_out', 'paid_out_balance', 'paidout', 'total_paid_out']),
-                        'total'     => $pick($b, ['total', 'total_balance', 'total_earned_gross', 'balance']),
-                        'currency'  => (string)($b['currency'] ?? 'USD'),
+                    $knownKeys = [
+                        'available', 'available_balance', 'available_amount',
+                        'pending', 'pending_balance', 'pending_release',
+                        'held', 'held_balance', 'locked', 'locked_balance', 'refund_locked',
+                        'paid_out', 'paid_out_balance', 'paidout', 'total_paid_out',
+                        'total', 'total_balance', 'total_earned_gross', 'balance',
                     ];
-                    if ($r['available'] + $r['pending'] + $r['paid_out'] + $r['total'] > 0) { return $r; }
+                   if ($hasAny($b, $knownKeys)) {
+                        return [
+                            'available' => $pick($b, ['available', 'available_balance', 'available_amount']),
+                            'pending'   => max(0.0, $pick($b, ['pending', 'pending_balance', 'pending_release'])),
+                            'locked'    => $pick($b, ['locked', 'locked_balance', 'refund_locked', 'held_balance']),
+                            'paid_out'  => $pick($b, ['paid_out', 'paid_out_balance']),
+                            'total'     => $pick($b, ['total', 'total_balance', 'balance']),
+                            'currency'  => (string)($b['currency'] ?? 'USD'),
+                            '_source'   => 'helper',
+                        ];
+                    }  
                 }
             } catch (Throwable) {}
         }
 
-        // Fallback: direct seller_balances snapshot read (read-only display).
-        if (table_exists('seller_balances')) {
-            $row = bv_sp_q1('SELECT * FROM seller_balances WHERE seller_id = ? LIMIT 1', [$sid]);
+         // Fallback: direct seller_balance_entries ledger read (read-only display).
+        if (table_exists('seller_balance_entries')) {
+            $row = bv_sp_q1(
+                "SELECT
+                    COALESCE(SUM(CASE WHEN status = 'pending' THEN amount ELSE 0 END),0) AS pending_amount,
+                    COALESCE(SUM(CASE WHEN available_at IS NOT NULL AND paid_out_at IS NULL THEN amount ELSE 0 END),0) AS available_amount,
+                    COALESCE(SUM(CASE WHEN paid_out_at IS NOT NULL THEN amount ELSE 0 END),0) AS paid_out_amount,
+                    COALESCE(SUM(CASE WHEN LOWER(COALESCE(status,'')) IN ('locked','held','hold','on_hold','refund_locked') THEN amount ELSE 0 END),0) AS locked_amount,
+                    COALESCE(SUM(amount),0) AS total_amount,
+                    COALESCE(MAX(NULLIF(currency,'')),'USD') AS currency
+                 FROM seller_balance_entries
+                 WHERE seller_id = ?",
+                [$sid]
+            );
             if ($row) {
                 return [
-                    'available' => (float)($row['available_balance']  ?? 0),
-                    'pending'   => max(0.0, (float)($row['pending_balance'] ?? 0)),
-                    'locked'    => (float)($row['held_balance']        ?? 0),
-                    'paid_out'  => (float)($row['paid_out_balance']    ?? 0),
-                    'total'     => (float)($row['total_earned_gross']  ?? 0),
-                    'currency'  => (string)($row['currency']           ?? 'USD'),
-                    '_source'   => 'snapshot',
+                 'available' => (float)($row['available_amount'] ?? 0),
+                    'pending'   => max(0.0, (float)($row['pending_amount'] ?? 0)),
+                    'locked'    => (float)($row['locked_amount'] ?? 0),
+                    'paid_out'  => (float)($row['paid_out_amount'] ?? 0),
+                    'total'     => (float)($row['total_amount'] ?? 0),
+                    'currency'  => (string)($row['currency'] ?? 'USD'),
+                    '_source'   => 'seller_balance_entries',
                 ];
             }
         }
@@ -509,95 +533,46 @@ if ($hasPayoutsTable && $dbAvailable) {
 }
 
 // ── Seller list ───────────────────────────────────────────────────────────────
-// Priority: users WHERE role='seller' + LEFT JOIN seller_applications (farm_name)
-//           + LEFT JOIN seller_balances (snapshot columns).
-// Also union any seller_balances rows whose user doesn't have role='seller'.
+// Source sellers from seller_balance_entries first; user/application tables are
+// optional enrichments only.
 $sellers = [];
 if ($dbAvailable) {
-    if ($hasUsersTable) {
-        $uSel  = [
-            'u.id AS seller_id',
-            'u.email',
-            'u.first_name',
-            'u.last_name',
-            'u.account_status',
-        ];
-        $uJoinA = '';
-        $uJoinB = '';
-        if ($hasSellerApps) {
-            $uSel[]  = 'sa.farm_name';
-            $uSel[]  = 'sa.application_status';
-            $uJoinA  = 'LEFT JOIN seller_applications sa ON sa.user_id = u.id';
-        } else {
-            $uSel[] = "NULL AS farm_name";
-            $uSel[] = "NULL AS application_status";
-        }
-        if ($hasSellerBalTable) {
-            $uSel[] = 'sb.available_balance';
-            $uSel[] = 'sb.pending_balance';
-            $uSel[] = 'sb.held_balance';
-            $uSel[] = 'sb.paid_out_balance';
-            $uSel[] = 'sb.total_earned_gross';
-            $uSel[] = "COALESCE(sb.currency,'USD') AS currency";
-            $uJoinB = 'LEFT JOIN seller_balances sb ON sb.seller_id = u.id';
-        } else {
-            $uSel[] = "0.0 AS available_balance";
-            $uSel[] = "0.0 AS pending_balance";
-            $uSel[] = "0.0 AS held_balance";
-            $uSel[] = "0.0 AS paid_out_balance";
-            $uSel[] = "0.0 AS total_earned_gross";
-            $uSel[] = "'USD' AS currency";
-        }
-        $sellers = bv_sp_q(
-            'SELECT ' . implode(', ', $uSel)
-            . " FROM users u $uJoinA $uJoinB"
-            . " WHERE u.role = 'seller'"
-            . ' ORDER BY u.id ASC LIMIT 200'
-        );
+if ($dbAvailable && $hasLedgerTable) {
+    $sSel = ['s.seller_id'];
+    $sJoinU = '';
+    $sJoinA = ''; 
 
-        // Also pick up sellers in seller_balances whose user role != 'seller'.
-        if ($hasSellerBalTable) {
-            $extSel = [
-                'sb.seller_id',
-                'COALESCE(u.email, \'\') AS email',
-                'COALESCE(u.first_name, \'\') AS first_name',
-                'COALESCE(u.last_name, \'\') AS last_name',
-                "COALESCE(u.account_status,'') AS account_status",
-                $hasSellerApps ? 'COALESCE(sa.farm_name,\'\') AS farm_name'            : "'' AS farm_name",
-                $hasSellerApps ? 'COALESCE(sa.application_status,\'\') AS application_status' : "'' AS application_status",
-                'sb.available_balance',
-                'sb.pending_balance',
-                'sb.held_balance',
-                'sb.paid_out_balance',
-                'sb.total_earned_gross',
-                "COALESCE(sb.currency,'USD') AS currency",
-            ];
-            $extJoins = 'LEFT JOIN users u ON u.id = sb.seller_id'
-                . ($hasSellerApps ? ' LEFT JOIN seller_applications sa ON sa.user_id = sb.seller_id' : '');
-            $extra = bv_sp_q(
-                'SELECT ' . implode(', ', $extSel)
-                . " FROM seller_balances sb $extJoins"
-                . " WHERE (u.id IS NULL OR u.role != 'seller')"
-                . ' ORDER BY sb.seller_id ASC LIMIT 50'
-            );
-            $existingIds = array_column($sellers, 'seller_id');
-            foreach ($extra as $e) {
-                if (!in_array((string)$e['seller_id'], array_map('strval', $existingIds), true)) {
-                    $sellers[] = $e;
-                }
-            }
-        }
-
-    } elseif ($hasSellerBalTable) {
-        // No users table — fall back to seller_balances only.
-        $sellers = bv_sp_q(
-            "SELECT seller_id, '' AS email, '' AS first_name, '' AS last_name,"
-            . " '' AS account_status, '' AS farm_name, '' AS application_status,"
-            . ' available_balance, pending_balance, held_balance, paid_out_balance,'
-            . " total_earned_gross, COALESCE(currency,'USD') AS currency"
-            . ' FROM seller_balances ORDER BY seller_id ASC LIMIT 200'
-        );
+   if ($hasUsersTable) {
+        $sSel[] = column_exists('users', 'email')          ? "COALESCE(u.email,'') AS email"                  : "'' AS email";
+        $sSel[] = column_exists('users', 'first_name')     ? "COALESCE(u.first_name,'') AS first_name"        : "'' AS first_name";
+        $sSel[] = column_exists('users', 'last_name')      ? "COALESCE(u.last_name,'') AS last_name"          : "'' AS last_name";
+        $sSel[] = column_exists('users', 'display_name')   ? "COALESCE(u.display_name,'') AS display_name"    : "'' AS display_name";
+        $sSel[] = column_exists('users', 'account_status') ? "COALESCE(u.account_status,'') AS account_status" : "'' AS account_status";
+        $sJoinU = 'LEFT JOIN users u ON u.id = s.seller_id';
+    } else {
+        $sSel[] = "'' AS email";
+        $sSel[] = "'' AS first_name";
+        $sSel[] = "'' AS last_name";
+        $sSel[] = "'' AS display_name";
+        $sSel[] = "'' AS account_status";
+    }  
+   if ($hasSellerApps) {
+        $sSel[] = column_exists('seller_applications', 'farm_name')          ? "COALESCE(sa.farm_name,'') AS farm_name" : "'' AS farm_name";
+        $sSel[] = column_exists('seller_applications', 'application_status') ? "COALESCE(sa.application_status,'') AS application_status" : "'' AS application_status";
+        $sJoinA = 'LEFT JOIN seller_applications sa ON sa.user_id = s.seller_id';
+    } else {
+        $sSel[] = "'' AS farm_name";
+        $sSel[] = "'' AS application_status";
     }
+
+    $sSel[] = "COALESCE((SELECT MAX(NULLIF(sbe2.currency,'')) FROM seller_balance_entries sbe2 WHERE sbe2.seller_id = s.seller_id),'USD') AS currency";
+
+    $sellers = bv_sp_q(
+        'SELECT ' . implode(', ', $sSel)
+        . ' FROM (SELECT DISTINCT seller_id FROM seller_balance_entries WHERE seller_id IS NOT NULL) s '
+        . $sJoinU . ' ' . $sJoinA
+        . ' ORDER BY s.seller_id ASC LIMIT 200'
+    );	
 }
 
 // ── Summary stats ─────────────────────────────────────────────────────────────
@@ -620,33 +595,38 @@ if ($hasPayoutsTable && $dbAvailable) {
         if ($s === 'paid')     { $stats['paid_payouts'] += (int)$row['cnt']; $stats['total_paid_amount'] += (float)$row['tot']; }
     }
 }
-// Quick aggregate from snapshot (no N+1 per seller).
-if ($hasSellerBalTable && $dbAvailable) {
-    $ag = bv_sp_q1('SELECT COALESCE(SUM(available_balance),0) av, COALESCE(SUM(pending_balance),0) pe,'
-                  . ' COALESCE(SUM(held_balance),0) lk, COALESCE(SUM(paid_out_balance),0) po'
-                  . ' FROM seller_balances');
-    if ($ag) {
-        $stats['total_available'] = (float)$ag['av'];
-        $stats['total_pending']   = (float)$ag['pe'];
-        $stats['total_locked']    = (float)$ag['lk'];
-        $stats['total_paid_out']  = (float)$ag['po'];
-    }
+foreach ($sellers as $_sr) {
+    $_sid = (int)($_sr['seller_id'] ?? 0);
+    if ($_sid <= 0) { continue; }
+    $_bal = bv_sp_read_balance($_sid);
+    $stats['total_available'] += (float)($_bal['available'] ?? 0);
+    $stats['total_pending']   += (float)($_bal['pending'] ?? 0);
+    $stats['total_locked']    += (float)($_bal['locked'] ?? 0);
+    $stats['total_paid_out']  += (float)($_bal['paid_out'] ?? 0);
 }
 
 // ── Recent ledger entries ─────────────────────────────────────────────────────
 $ledgerEntries   = [];
 $ledgerTableUsed = '';
-foreach ([
-    'seller_ledger'          => ['id','seller_id','type','balance_type','direction','amount','balance_after','reference_type','reference_id','note','created_at'],
-    'seller_balance_entries' => ['id','seller_id','type','direction','amount','balance_after','reference_type','reference_id','note','created_at'],
-] as $_lt => $_lc) {
-    if (!($dbAvailable && table_exists($_lt))) { continue; }
-    $lSel = [];
-    foreach ($_lc as $c) { if (column_exists($_lt, $c)) { $lSel[] = '`' . $c . '`'; } }
-    if (!$lSel) { continue; }
-    $ledgerEntries   = bv_sp_q('SELECT ' . implode(', ', $lSel) . ' FROM `' . $_lt . '` ORDER BY id DESC LIMIT 30');
-    $ledgerTableUsed = $_lt;
-    if ($ledgerEntries) { break; }
+if ($dbAvailable && $hasLedgerTable) {
+    $ledgerEntries = bv_sp_q(
+        "SELECT
+            id,
+            seller_id,
+            status AS type,
+            source AS balance_type,
+            CASE WHEN amount >= 0 THEN 'credit' ELSE 'debit' END AS direction,
+            amount,
+            0 AS balance_after,
+            source AS reference_type,
+            COALESCE(order_item_id, order_id, listing_id) AS reference_id,
+            hold_reason AS note,
+            created_at
+         FROM seller_balance_entries
+         ORDER BY id DESC
+         LIMIT 30"
+    );
+    $ledgerTableUsed = 'seller_balance_entries';
 }
 
 ?>
@@ -970,11 +950,11 @@ details summary{cursor:pointer;font-weight:600;font-size:13px;color:var(--accent
 <div class="panel">
     <div class="ph2">
         <h2>Recent Ledger Entries</h2>
-        <span style="font-size:12px;color:var(--muted)"><?php echo h($ledgerTableUsed ?: 'seller_ledger'); ?> &mdash; last 30 rows (read-only)</span>
+        <span style="font-size:12px;color:var(--muted)"><?php echo h($ledgerTableUsed ?: 'seller_balance_entries'); ?> &mdash; last 30 rows (read-only)</span>
     </div>
     <div class="pb">
     <?php if (!$ledgerEntries): ?>
-        <p class="empty">No ledger entries<?php echo $dbAvailable ? ' found in seller_ledger or seller_balance_entries.' : ' (DB unavailable).'; ?></p>
+       <p class="empty">No ledger entries<?php echo $dbAvailable ? ' found in seller_balance_entries.' : ' (DB unavailable).'; ?></p>
     <?php else: ?>
     <div class="tw"><table>
     <thead><tr><th>ID</th><th>Seller</th><th>Type</th><th>Dir</th><th>Amount</th><th>Bal After</th><th>Ref Type</th><th>Ref ID</th><th>Note</th><th>Date</th></tr></thead>
